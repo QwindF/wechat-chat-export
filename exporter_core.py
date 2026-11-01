@@ -5,6 +5,7 @@ import hashlib
 import html
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -18,7 +19,7 @@ import urllib.request
 import zipfile
 from collections import Counter
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 import xml.etree.ElementTree as ET
@@ -27,8 +28,11 @@ import zstandard as zstd
 from wechatauto import MediaDownloader, WeChatDB
 from PIL import Image, ImageStat
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+# datetime.fromtimestamp 在 Windows 本地时区可表示的秒级上界
+# （2100-01-01 08:00，UTC+8）；负 epoch 在 Windows 会抛 OSError。
+_MAX_SUPPORTED_TS = 4102444800
 
 RUST_SILK_URL = (
     "https://github.com/Wangnov/rust-silk/releases/download/v0.1.3/"
@@ -740,11 +744,163 @@ def _json_message_id(value):
     return value
 
 
-def load_rows(db: WeChatDB, username: str):
-    """跨全部 message_*.db 读取，保留来源库，避免只命中第一个分片。"""
+def parse_time_bound(value, label="时间"):
+    """把 None / int / float / datetime / 字符串统一成秒级 Unix 时间戳。
+
+    带毫秒的时间戳（> 1e11）会按毫秒解析。字符串支持 ``2026-10-25`` 与
+    ``2026-10-25 08:30`` 两种写法，本地时区。返回值保证能被
+    ``datetime.fromtimestamp`` 表示（0 <= ts <= 4102444800，即本地时间
+    1970-01-01 08:00 至 2100-01-01 08:00，UTC+8）。
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        try:
+            ts = int(value.timestamp())
+        except (ValueError, OSError, OverflowError):
+            raise ValueError(
+                f"{label}格式无法识别：{value!r}（示例：2026-10-25 或 2026-10-25 08:30）"
+            ) from None
+    elif isinstance(value, bool):
+        raise ValueError(f"{label}格式无法识别：{value!r}")
+    elif isinstance(value, (int, float)):
+        try:
+            ts = int(value)
+        except (ValueError, OverflowError):
+            raise ValueError(f"{label}格式无法识别：{value!r}") from None
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            ts = int(datetime.fromisoformat(text).timestamp())
+        except (ValueError, OSError, OverflowError):
+            raise ValueError(
+                f"{label}格式无法识别：{value!r}（示例：2026-10-25 或 2026-10-25 08:30）"
+            ) from None
+    if ts > 100_000_000_000:
+        ts //= 1000
+    if ts < 0 or ts > _MAX_SUPPORTED_TS:
+        raise ValueError(
+            f"{label}超出支持范围（支持 1970 至 2099 年间的时间，本地时区）：{value!r}"
+        )
+    return ts
+
+
+def last_days_window(days) -> dict:
+    """把「最近 N 天」换算成窗口参数，CLI 与 GUI 共用。
+
+    返回 ``{"since": datetime, "until": None}``。结束时间故意留空：
+    导出过程中新到的消息也应包含，避免卡在边界漏消息。调用方（CLI）
+    一次运行内应只调用一次并复用返回值，避免两次 ``now()`` 得到
+    不一致的 since 或目录后缀。
+    """
+    try:
+        value = float(days)
+    except (TypeError, ValueError):
+        raise ValueError(f"时间范围的天数必须是数字，例如 7 或 0.5；收到：{days!r}") from None
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("时间范围的天数必须是有限正数，例如 7 或 0.5。")
+    try:
+        delta = timedelta(days=value)
+    except (OverflowError, ValueError):
+        raise ValueError("时间范围过大，请换一个更小的天数。") from None
+    since = datetime.now() - delta
+    if since < datetime(1970, 1, 2) or since > datetime(2100, 1, 1):
+        raise ValueError("时间范围过大，起始时间已超出支持范围（1970 至 2099 年间）。")
+    return {"since": since, "until": None}
+
+
+def build_window_suffix(since, until) -> str:
+    """窗口导出时的目录后缀，避免覆盖同名全量导出。
+
+    整日边界用 ``YYYYMMDD``；带时分秒的边界（如 ``--last-days``）补到分钟，
+    否则同一天的两个不同窗口会撞到同一个目录。
+    """
+    if since is None and until is None:
+        return ""
+
+    def fmt(ts):
+        if ts is None:
+            return "open"
+        dt = datetime.fromtimestamp(ts)
+        if dt.hour or dt.minute or dt.second:
+            return dt.strftime("%Y%m%d%H%M")
+        return dt.strftime("%Y%m%d")
+
+    return f"_{fmt(since)}-{fmt(until)}"
+
+
+def _apply_window_suffix(name: str, suffix: str) -> str:
+    """单会话路径拼窗口后缀。
+
+    必须先按 ``100 - len(suffix)`` 截断基础名再拼后缀：``safe_folder_name``
+    末尾的 ``[:100]`` 砍的是尾部，直接拼接会把后缀吃掉，导致窗口目录
+    退化成全量目录、覆盖已有的全量导出。
+    """
+    if not suffix:
+        return name
+    base = (name or "").strip() or "未命名会话"
+    keep = max(1, 100 - len(suffix))
+    return base[:keep] + suffix
+
+
+def _describe_window(since, until) -> str:
+    def fmt(v):
+        return (
+            datetime.fromtimestamp(v).strftime("%Y-%m-%d %H:%M:%S")
+            if v is not None
+            else "不限"
+        )
+
+    return f"{fmt(since)} ~ {fmt(until)}"
+
+
+def _has_null_sort_seq(conn, table) -> bool:
+    """探测分片中是否真的存在 NULL sort_seq（仅窗口模式需要）。
+
+    用 ``SELECT 1 ... LIMIT 1`` 走 covering index 实测（约 0.24ms/10 万行），
+    而不是 PRAGMA table_info——后者在无约束 DDL 上永远返回 notnull=0，
+    判不出真实数据。探测失败（如表被锁）按无 NULL 处理，不中断导出。
+    """
+    try:
+        row = conn.execute(
+            f"SELECT 1 FROM {table} WHERE sort_seq IS NULL LIMIT 1"
+        ).fetchone()
+    except Exception:
+        return False
+    return row is not None
+
+
+def load_rows(db: WeChatDB, username: str, since=None, until=None, stats=None):
+    """跨全部 message_*.db 读取，保留来源库，避免只命中第一个分片。
+
+    ``since``/``until`` 为秒级 Unix 时间戳，语义是左闭右开 ``[since, until)``。
+    窗口过滤条件只用 ``sort_seq``：``create_time`` 没有索引，拿它做条件会让查询
+    退化成全表扫描；``sort_seq`` 有单列索引，且末三位是同秒排序号，能精确
+    切分同一秒内的多条消息。仅当分片里真的存在 NULL ``sort_seq`` 时才用
+    ``OR sort_seq IS NULL`` 把这些行取回，再按 ``create_time`` 在 Python 侧
+    兜底判断是否落在窗口内（``create_time`` 缺失的行直接跳过）；计数写入
+    ``stats["null_sort_seq_rows"]`` / ``stats["null_sort_seq_skipped"]``。
+    排序统一由本函数末尾的 Python 完成，SQL 不再 ORDER BY（避免临时 B 树）。
+    """
     md5hex = hashlib.md5(username.encode("utf-8")).hexdigest()
     table = "Msg_" + md5hex
     rows = []
+    windowed = since is not None or until is not None
+    base_cond, params = "", []
+    if windowed:
+        if since is not None:
+            base_cond += " AND sort_seq >= ?"
+            params.append(int(since) * 1000)
+        if until is not None:
+            base_cond += " AND sort_seq < ?"
+            params.append(int(until) * 1000)
+        base_cond = base_cond[len(" AND "):]
+
+    def _count(kind):
+        if stats is not None:
+            stats[kind] = stats.get(kind, 0) + 1
 
     for rel in db._message_dbs():
         conn = db._open(rel)
@@ -763,16 +919,44 @@ def load_rows(db: WeChatDB, username: str):
                 "packed_info_data", "sort_seq",
             ]
             select_cols = [c for c in wanted if c in cols]
+            if windowed and "sort_seq" not in cols:
+                raise ValueError(
+                    f"会话表 {table} 缺少 sort_seq 列，无法按时间窗口取数；"
+                    "请去掉 --since/--until/--last-days 后重试。"
+                )
             sender_index, map_status = _sender_map(conn)
-            cur = conn.execute(
-                "SELECT " + ", ".join(select_cols) + f" FROM {table}"
-            )
+            where = ""
+            if windowed:
+                cond = base_cond
+                if _has_null_sort_seq(conn, table):
+                    # SQL 三值逻辑下 NULL 不命中 >= / <，必须显式取回后在
+                    # Python 侧按 create_time 兜底，否则会被静默丢弃。
+                    cond = f"({cond}) OR sort_seq IS NULL"
+                where = f" WHERE {cond}"
+            sql = "SELECT " + ", ".join(select_cols) + f" FROM {table}{where}"
+            cur = conn.execute(sql, params)
             names = [d[0] for d in cur.description]
             for raw in cur.fetchall():
                 item = dict(zip(names, raw))
                 for c in wanted:
                     item.setdefault(c, None)
                 item["_db_rel"] = rel
+                if windowed and item.get("sort_seq") is None:
+                    raw_ct = item.get("create_time")
+                    try:
+                        ct = int(raw_ct)
+                        if ct > 10_000_000_000:
+                            ct //= 1000
+                    except (TypeError, ValueError):
+                        ct = None
+                    if (
+                        ct is None
+                        or (since is not None and ct < since)
+                        or (until is not None and ct >= until)
+                    ):
+                        _count("null_sort_seq_skipped")
+                        continue
+                    _count("null_sort_seq_rows")
                 sid = _sender_id(item["real_sender_id"])
                 sender_username = _identity_username(sender_index.get(sid))
                 if sid is None:
@@ -791,12 +975,15 @@ def load_rows(db: WeChatDB, username: str):
         finally:
             conn.close()
 
-    rows.sort(
-        key=lambda r: (
-            (r.get("sort_seq") or 0),
-            (r.get("local_id") or 0),
-        )
-    )
+    def _sort_key(r):
+        seq = r.get("sort_seq")
+        if seq is None:
+            # 全量与窗口统一：NULL sort_seq 的行按 create_time 换算成毫秒
+            # 参与排序，不再错误地排到对话最前面。
+            seq = _normalize_timestamp(r.get("create_time")) * 1000
+        return (seq, r.get("local_id") or 0)
+
+    rows.sort(key=_sort_key)
     return rows
 
 
@@ -2539,6 +2726,8 @@ def _export_chat_impl(
     contact=None,
     folder_name=None,
     index_cache=None,
+    since=None,
+    until=None,
 ):
     def log(msg):
         if progress:
@@ -2546,6 +2735,12 @@ def _export_chat_impl(
 
     if transcribe_voices:
         export_voices = True
+
+    since = parse_time_bound(since, "起始时间")
+    until = parse_time_bound(until, "结束时间")
+    if since is not None and until is not None and since >= until:
+        raise ValueError("起始时间必须早于结束时间。")
+    window_suffix = build_window_suffix(since, until)
 
     if db is None:
         if db_dir:
@@ -2566,13 +2761,39 @@ def _export_chat_impl(
         raise ValueError("必须提供会话关键词或已解析的联系人。")
     is_group = username.endswith("@chatroom")
     log(f"已识别：{'群聊' if is_group else '私聊'} · {target_name}")
-    log("正在读取消息…")
-    rows = load_rows(db, username)
+    if window_suffix:
+        span = _describe_window(since, until)
+        log(f"正在读取消息…（时间窗口：{span}）")
+    else:
+        log("正在读取消息…")
+    window_stats = {}
+    rows = load_rows(db, username, since=since, until=until, stats=window_stats)
     if not rows:
+        if window_suffix:
+            raise EmptyConversationError(
+                f"时间窗口 {_describe_window(since, until)} 内没有消息。"
+            )
         raise EmptyConversationError("没有读取到该会话的消息。")
+    if window_suffix:
+        null_rows = window_stats.get("null_sort_seq_rows", 0)
+        null_skipped = window_stats.get("null_sort_seq_skipped", 0)
+        if null_rows or null_skipped:
+            log(
+                f"提示：窗口内有 {null_rows} 条消息缺少 sort_seq，已按 create_time 兜底；"
+                f"另有 {null_skipped} 条在窗口外或时间缺失，已被排除。"
+            )
 
     out_root = Path(out_root)
-    chat_dir = out_root / safe_folder_name(folder_name or target_name)
+    if folder_name:
+        # 批量路径：后缀已在 _stable_batch_folder 里拼好，这里直接使用，
+        # 不能再追加，否则会出现双后缀。
+        chat_dir = out_root / safe_folder_name(folder_name)
+    else:
+        # 单会话路径：先按 100 - len(suffix) 截断基础名再拼后缀，
+        # 保证后缀不被 safe_folder_name 的 100 字符上限吃掉。
+        chat_dir = out_root / safe_folder_name(
+            _apply_window_suffix(target_name, window_suffix)
+        )
     chat_dir.mkdir(parents=True, exist_ok=True)
 
     cache = index_cache if index_cache is not None else {}
@@ -2885,17 +3106,33 @@ def _export_chat_impl(
     json_path = chat_dir / "chat_full_parsed.json"
     _write_txt(parsed, txt_path, is_group, target_name)
     _write_markdown(parsed, md_path, is_group, target_name)
+    payload = {
+        "exporter_version": APP_VERSION,
+        "chat_type": "group" if is_group else "private",
+        "chat_name": target_name,
+        "message_count": len(parsed),
+        "type_counts": type_counts,
+        "sender_resolution_counts": dict(sender_counts),
+        "media_stats": media_stats,
+        "messages": parsed,
+    }
+    if window_suffix:
+        # 让导出结果自带窗口信息，日后不靠目录名猜区间。左闭右开。
+        payload["time_window"] = {
+            "since": (
+                datetime.fromtimestamp(since).strftime("%Y-%m-%d %H:%M:%S")
+                if since is not None else None
+            ),
+            "until": (
+                datetime.fromtimestamp(until).strftime("%Y-%m-%d %H:%M:%S")
+                if until is not None else None
+            ),
+            # 窗口内靠 create_time 兜底取回的消息数；0 也写入，便于确认
+            # 这张表确实没有 NULL sort_seq 的行。
+            "null_sort_seq_rows": window_stats.get("null_sort_seq_rows", 0),
+        }
     with json_path.open("w", encoding="utf-8-sig") as f:
-        json.dump({
-            "exporter_version": APP_VERSION,
-            "chat_type": "group" if is_group else "private",
-            "chat_name": target_name,
-            "message_count": len(parsed),
-            "type_counts": type_counts,
-            "sender_resolution_counts": dict(sender_counts),
-            "media_stats": media_stats,
-            "messages": parsed,
-        }, f, ensure_ascii=False, indent=2)
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
     log(f"完成：{len(parsed)} 条消息")
     summaries = [
@@ -2952,15 +3189,20 @@ _BATCH_SPECIAL_PREFIXES = ("gh_",)
 _BATCH_MSG_TABLE_RE = re.compile(r"^Msg_([0-9a-fA-F]{32})$")
 
 
-def _stable_batch_folder(username: str) -> str:
-    """Folder identity depends only on stable username, never display order/name."""
+def _stable_batch_folder(username: str, suffix: str = "") -> str:
+    """Folder identity depends only on stable username, never display order/name.
+
+    ``suffix`` 是时间窗口后缀：stem 的截断长度会为后缀预留空间，保证
+    `` [digest]`` 永远完整（不同 username 不串目录）且总长 ≤100。
+    ``suffix`` 为空时输出与无窗口版本逐字符一致。
+    """
     value = _identity_username(username)
     if value is None:
         raise ValueError("批量导出的会话 username 无效。")
     base = safe_folder_name(value)
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:10]
-    stem = base[: max(1, 96 - len(digest))]
-    return safe_folder_name(f"{stem} [{digest}]")
+    stem = base[: max(1, 96 - len(digest) - len(suffix))]
+    return safe_folder_name(f"{stem} [{digest}]{suffix}")
 
 
 def _batch_message_hashes(db) -> set[str]:
@@ -3132,6 +3374,9 @@ def _write_all_chats_index(out_root: Path, chats: list[dict], meta: dict):
             indent=2,
         )
 
+    window = meta.get("time_window")
+    windowed = bool(window)
+    empty_label = "窗口内无消息" if windowed else "无消息"
     lines = [
         "# 全部聊天导出索引",
         "",
@@ -3140,7 +3385,7 @@ def _write_all_chats_index(out_root: Path, chats: list[dict], meta: dict):
         f"- 可可靠识别的本地会话：{meta['discovered_total']}",
         f"- 无法可靠反查身份的消息表：{meta['unresolved_message_tables']}",
         f"- 本次处理：{meta['selected_total']}",
-        f"- 成功：{meta['exported']}；无消息：{meta['skipped_empty']}；失败：{meta['failed']}",
+        f"- 成功：{meta['exported']}；{empty_label}：{meta['skipped_empty']}；失败：{meta['failed']}",
         f"- 消息总数：{meta['total_messages']}",
         "",
     ]
@@ -3149,8 +3394,16 @@ def _write_all_chats_index(out_root: Path, chats: list[dict], meta: dict):
             f"- 本次使用 `--limit`，仅处理最近的 {meta['selected_total']} 个会话。",
             "",
         ])
+    if window:
+        lines.extend([
+            f"- 时间窗口：{window.get('since') or '不限'} ~ {window.get('until') or '不限'}"
+            "（含起点，不含终点）",
+            "- 注：「会话最近消息」来自会话表，可能晚于窗口结束。",
+            "",
+        ])
     lines.extend([
-        "| 会话 | 类型 | 最近消息 | 消息数 | 状态 / 文件夹 |",
+        f"| 会话 | 类型 | {'会话最近消息' if windowed else '最近消息'} "
+        f"| {'窗口内消息数' if windowed else '消息数'} | 状态 / 文件夹 |",
         "| --- | --- | --- | ---: | --- |",
     ])
 
@@ -3160,7 +3413,13 @@ def _write_all_chats_index(out_root: Path, chats: list[dict], meta: dict):
             href = _markdown_href(item["folder"])
             status = f"[{item['folder']}]({href})"
         elif item["status"] == "skipped_empty":
-            status = "无消息"
+            if windowed:
+                # 复用后端生成的窗口文案（含具体区间），保持口径一致。
+                status = str(
+                    item.get("error") or empty_label
+                ).replace("|", "\\|")
+            else:
+                status = "无消息"
         else:
             error = str(item.get("error") or "未知错误").replace("|", "\\|")
             status = f"失败：{error}"
@@ -3187,6 +3446,8 @@ def _export_all_chats_impl(
     db_dir=None,
     workdir=None,
     limit=None,
+    since=None,
+    until=None,
 ):
     def log(message):
         if progress:
@@ -3194,6 +3455,11 @@ def _export_all_chats_impl(
 
     if transcribe_voices:
         export_voices = True
+
+    since = parse_time_bound(since, "起始时间")
+    until = parse_time_bound(until, "结束时间")
+    if since is not None and until is not None and since >= until:
+        raise ValueError("起始时间必须早于结束时间。")
 
     if db_dir:
         db_dir = resolve_db_dir(db_dir)
@@ -3229,10 +3495,13 @@ def _export_all_chats_impl(
     index_cache = {}
     results = []
     exported = skipped_empty = failed = total_messages = 0
+    # 与 _export_chat_impl 内部各自计算一次：输入相同、结果确定一致，
+    # 后缀已在这里烘进 folder，_impl 内部不得再追加。
+    window_suffix = build_window_suffix(since, until)
 
     for position, contact in enumerate(chats, 1):
         name = contact.get("name") or contact["username"]
-        folder = _stable_batch_folder(contact["username"])
+        folder = _stable_batch_folder(contact["username"], window_suffix)
         entry = {
             "name": name,
             "username": contact["username"],
@@ -3266,12 +3535,17 @@ def _export_all_chats_impl(
                 contact=contact,
                 folder_name=folder,
                 index_cache=index_cache,
+                since=since,
+                until=until,
             )
         except EmptyConversationError as exc:
             entry["status"] = "skipped_empty"
             entry["error"] = str(exc)
             skipped_empty += 1
-            log(f"该会话没有可读取的本地消息，已跳过：{name}")
+            if window_suffix:
+                log(f"该会话在时间窗口内没有消息，已跳过：{name}")
+            else:
+                log(f"该会话没有可读取的本地消息，已跳过：{name}")
         except Exception as exc:
             entry["status"] = "failed"
             entry["error"] = f"{type(exc).__name__}: {exc}"
@@ -3282,6 +3556,8 @@ def _export_all_chats_impl(
                 "status": "exported",
                 "message_count": result["message_count"],
                 "output_dir": result["output_dir"],
+                # 时间窗口会在实际目录名后追加后缀，索引必须指向真实目录。
+                "folder": Path(result["output_dir"]).name,
                 "txt": result["txt"],
                 "md": result["md"],
                 "json": result["json"],
@@ -3309,6 +3585,17 @@ def _export_all_chats_impl(
         "export_videos": bool(export_videos),
         "transcribe_voices": bool(transcribe_voices),
     }
+    if since is not None or until is not None:
+        meta["time_window"] = {
+            "since": (
+                datetime.fromtimestamp(since).strftime("%Y-%m-%d %H:%M:%S")
+                if since is not None else None
+            ),
+            "until": (
+                datetime.fromtimestamp(until).strftime("%Y-%m-%d %H:%M:%S")
+                if until is not None else None
+            ),
+        }
     index_json, index_md = _write_all_chats_index(out_root, results, meta)
     log(
         f"全部完成：成功 {exported}、无消息 {skipped_empty}、失败 {failed}；"
@@ -3335,6 +3622,8 @@ def export_all_chats(
     transcribe_voices=False,
     db_dir=None,
     limit=None,
+    since=None,
+    until=None,
 ):
     """Export all reliably identified local private/group conversations."""
     if limit is not None:
@@ -3369,6 +3658,8 @@ def export_all_chats(
                 db_dir=db_dir,
                 workdir=str(workdir),
                 limit=limit,
+                since=since,
+                until=until,
             )
     except BaseException:
         _cleanup_sensitive_workdir(workdir, progress=progress)
@@ -3393,6 +3684,8 @@ def export_chat(
     export_videos=False,
     transcribe_voices=False,
     db_dir=None,
+    since=None,
+    until=None,
 ):
     # 导出前顺便清理本项目上次异常退出留下、且已确认失效的工作目录。
     stale_report = clear_current_sensitive_cache()
@@ -3422,6 +3715,8 @@ def export_chat(
                 transcribe_voices=transcribe_voices,
                 db_dir=db_dir,
                 workdir=str(workdir),
+                since=since,
+                until=until,
             )
     except BaseException:
         # KeyboardInterrupt / SystemExit 也先尽力删除本次敏感工作目录，再原样抛出。

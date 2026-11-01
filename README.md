@@ -4,7 +4,7 @@
 
 如果这个工具对你有帮助，欢迎点个 Star。
 
-目前源码版本：**v1.4.0**
+目前源码版本：**v1.5.0**
 
 支持私聊和群聊，可处理文字、长文本、引用回复、系统消息，并尽量导出本机仍有缓存的图片、文件、语音和视频。v1.4.0 起支持一次导出本机全部可可靠识别的聊天。
 
@@ -12,13 +12,21 @@
 
 稳定版本：
 
-[GitHub Releases](https://github.com/zhuzhangxue/wechat-chat-export/releases)
+[GitHub Releases](https://github.com/QwindF/wechat-chat-export/releases)
 
 如果 Release 还没更新，也可以到：
 
-[GitHub Actions](https://github.com/zhuzhangxue/wechat-chat-export/actions)
+[GitHub Actions](https://github.com/QwindF/wechat-chat-export/actions)
 
 下载最新一次 `Build Windows EXE` 的 artifact。
+
+从源码获取：
+
+```bash
+git clone https://github.com/QwindF/wechat-chat-export.git
+```
+
+> 本仓库分支自 [zhuzhangxue/wechat-chat-export](https://github.com/zhuzhangxue/wechat-chat-export)，在原版基础上增加了按时间窗口导出（`--since` / `--until` / `--last-days`）等改动。原始著作权归原作者，遵循 Apache-2.0 许可。
 
 Windows 版是单文件 EXE，不需要另外安装 Python。
 
@@ -109,6 +117,38 @@ exports/
 批量模式的会话文件夹**只由稳定 `username` 派生**，不由备注名、昵称或本次处理顺序决定。这样即使两个联系人同名，或者最近聊天顺序发生变化，多次导出也不会把不同人的历史结果写进同一个目录。可读的备注/昵称保留在总索引和每个会话的导出文件中。
 
 勾选图片、文件、语音或视频后，这些选项会应用到批次中的每个会话，可能明显增加运行时间和磁盘占用。建议第一次先用 `--limit` 试跑。
+
+## 只导出最近一段时间
+
+v1.5.0 起支持按时间范围导出，单个会话和批量都可用：
+
+```powershell
+# 最近 7 天（可带小数，0.5 = 12 小时）
+python cli.py --all --last-days 7
+python cli.py "好友备注名" --last-days 7
+
+# 指定起止时间，含起点、不含终点
+python cli.py --all --since "2026-10-25" --until "2026-11-01"
+python cli.py "好友备注名" --since "2026-10-25 08:30"
+
+# 与 --limit 组合：最近的 20 个会话里，只要最近 7 天
+python cli.py --all --limit 20 --last-days 7 --images
+```
+
+GUI 在「时间范围：最近 __ 天」里填天数即可，留空表示导出全部历史。
+
+行为说明：
+
+- 时间窗口**只精确到秒**。消息表里同一秒内的多条消息用 `sort_seq` 末三位区分，所以秒级边界不会把同一秒的消息切一半，但 `08:30:15.500` 这样的亚秒参数没有意义；
+- 时间参数支持 1970 至 2099 年间的时间（本地时区）；超出范围会直接报错，不会带出半个结果；
+- `--last-days` 不设结束时间，导出过程中新到的消息也会被包含，避免卡在边界漏消息；
+- 窗口导出的目录名会追加后缀，避免覆盖同名全量导出：`wxid_xxx [稳定摘要]_20261025-20261101`、`..._202610251326-open`（同一天的不同时刻带时分）。会话名特别长时基础名会先截断再拼后缀，后缀永远完整；批量目录的 `[稳定摘要]` 也永远保留；
+- 重复导出的目录策略：显式 `--since/--until` 重跑同一窗口会**原地覆盖**（后缀相同）；`--last-days` 的后缀精确到分钟，跨分钟重跑会生成**新目录**，同一分钟内重跑则原地覆盖；
+- 单个会话导出的 `chat_full_parsed.json` 顶层会多一个 `time_window` 字段；批量导出的 `all_chats_index.json` 和 `.md` 也会记录本次窗口；
+- 极少数消息可能缺少 `sort_seq`：窗口导出时会按消息时间兜底判断是否落在窗口内（时间也缺失的会被跳过），并在日志和 `time_window.null_sort_seq_rows` 中说明，不会静默丢消息；
+- 窗口内没有消息的会话在批量模式下会标注「时间窗口 … 内没有消息」并跳过，不算失败。
+
+性能参考（2 个消息分片、单个约 39 万条消息的群聊）：全量导出 60 秒 / 268 MB，近 7 天约 5% 的数据降到 3–6 秒 / 约 15 MB。数据库解密是固定开销（约 10 秒），与窗口大小无关，差别在后续解析、媒体解密和写盘。
 
 ## 微信数据目录
 

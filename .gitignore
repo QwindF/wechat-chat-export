@@ -1,6 +1,27 @@
 # 聊天导出结果
 exports/
+exports*/
 final_export/
+
+# 聊天原文衍生数据（分析/统计/图表产物，含真实昵称与消息内容，绝不能入库）
+analysis/
+analysis*/
+*_analysis/
+chatlog*/
+chat_logs/
+# 仓库根目录下的分析报告（含真实姓名、群名、互动频次）
+/聊天记录分析报告*.md
+/*分析报告*.md
+
+# 运行日志（可能含本机路径与媒体文件名）
+*.log
+logs/
+
+# 本地虚拟环境
+.venv/
+
+# WorkBuddy 本地数据
+.workbuddy/
 
 # 微信解密密钥和缓存
 **/keys.json
@@ -25,3 +46,6 @@ dist/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 本地工具/智能体工作目录（spec、评审记录等过程产物，不入库）
+.trae/

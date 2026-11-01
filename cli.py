@@ -2,11 +2,13 @@
 import argparse
 
 from exporter_core import (
+    EmptyConversationError,
     clear_sensitive_cache,
     export_all_chats,
     export_chat,
     install_local_asr_model,
     install_rust_silk,
+    last_days_window,
 )
 
 
@@ -52,6 +54,28 @@ if __name__ == "__main__":
         help="配合 --all 使用：只导出最近的 N 个会话，便于先小范围试跑",
     )
     p.add_argument(
+        "--last-days",
+        type=float,
+        default=None,
+        metavar="N",
+        help=(
+            "只导出最近 N 天的消息（可带小数，如 0.5 表示 12 小时）。"
+            "结束时间不限，确保导出期间新到的消息不丢；与 --since/--until 互斥"
+        ),
+    )
+    p.add_argument(
+        "--since",
+        default=None,
+        metavar="TIME",
+        help="起始时间（含）。格式：2026-10-25 或 「2026-10-25 08:30」",
+    )
+    p.add_argument(
+        "--until",
+        default=None,
+        metavar="TIME",
+        help="结束时间（不含）。格式同上；不填表示不限",
+    )
+    p.add_argument(
         "--install-asr",
         action="store_true",
         help="下载安装本地 SenseVoice 语音识别模型后退出",
@@ -83,6 +107,16 @@ if __name__ == "__main__":
         p.error("--limit 必须是正整数。")
     if a.limit is not None and not a.export_all:
         p.error("--limit 只能配合 --all 使用。")
+    window = {"since": a.since, "until": a.until}
+    if a.last_days is not None:
+        if a.since or a.until:
+            p.error("--last-days 不能与 --since/--until 同时使用。")
+        # helper 只调用一次，校验与窗口构造复用同一返回值，
+        # 避免两次 now() 得到不一致的 since 或目录后缀。
+        try:
+            window = last_days_window(a.last_days)
+        except ValueError as exc:
+            p.error(str(exc))
 
     if a.install_asr:
         install_local_asr_model(progress=print)
@@ -107,20 +141,26 @@ if __name__ == "__main__":
                 )
             raise SystemExit(1)
         raise SystemExit(0)
+
     if a.export_all:
         if a.name:
             print(f"注意：已指定 --all，忽略会话关键词“{a.name}”。")
-        result = export_all_chats(
-            a.out,
-            progress=print,
-            export_images=(a.images or a.media),
-            export_files=(a.files or a.media),
-            export_voices=(a.voices or a.media or a.transcribe_voices),
-            export_videos=(a.videos or a.media),
-            transcribe_voices=a.transcribe_voices,
-            db_dir=a.db_dir,
-            limit=a.limit,
-        )
+        try:
+            result = export_all_chats(
+                a.out,
+                progress=print,
+                export_images=(a.images or a.media),
+                export_files=(a.files or a.media),
+                export_voices=(a.voices or a.media or a.transcribe_voices),
+                export_videos=(a.videos or a.media),
+                transcribe_voices=a.transcribe_voices,
+                db_dir=a.db_dir,
+                limit=a.limit,
+                **window,
+            )
+        except (ValueError, EmptyConversationError) as exc:
+            print(f"导出中止：{exc}")
+            raise SystemExit(2) from None
         print(
             f"可可靠识别会话 {result['discovered_total']}，"
             f"本次处理 {result['selected_total']}；"
@@ -149,15 +189,20 @@ if __name__ == "__main__":
             "--clear-sensitive-cache"
         )
 
-    result = export_chat(
-        a.name,
-        a.out,
-        progress=print,
-        export_images=(a.images or a.media),
-        export_files=(a.files or a.media),
-        export_voices=(a.voices or a.media or a.transcribe_voices),
-        export_videos=(a.videos or a.media),
-        transcribe_voices=a.transcribe_voices,
-        db_dir=a.db_dir,
-    )
+    try:
+        result = export_chat(
+            a.name,
+            a.out,
+            progress=print,
+            export_images=(a.images or a.media),
+            export_files=(a.files or a.media),
+            export_voices=(a.voices or a.media or a.transcribe_voices),
+            export_videos=(a.videos or a.media),
+            transcribe_voices=a.transcribe_voices,
+            db_dir=a.db_dir,
+            **window,
+        )
+    except (ValueError, EmptyConversationError) as exc:
+        print(f"导出中止：{exc}")
+        raise SystemExit(2) from None
     print(result)

@@ -19,6 +19,7 @@ from exporter_core import (
     export_chat,
     install_local_asr_model,
     install_rust_silk,
+    last_days_window,
     local_asr_status,
     rust_silk_status,
 )
@@ -76,7 +77,7 @@ class App(tk.Tk):
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(0, weight=1)
         pad.grid_columnconfigure(0, weight=1)
-        pad.grid_rowconfigure(9, weight=1)
+        pad.grid_rowconfigure(10, weight=1)
 
         ttk.Label(
             pad,
@@ -177,9 +178,23 @@ class App(tk.Tk):
         ttk.Label(
             pad,
             text="仅导出本机仍有缓存的附件；“语音转文字（本地）”默认关闭，勾选后会自动同时导出语音。",
-        ).grid(row=7, column=0, sticky="w", pady=(2, 4))
+        ).grid(row=8, column=0, sticky="w", pady=(2, 4))
 
-        ttk.Separator(pad).grid(row=8, column=0, sticky="ew", pady=10)
+        winrow = ttk.Frame(pad)
+        winrow.grid(row=7, column=0, sticky="ew", pady=(4, 2))
+        ttk.Label(winrow, text="时间范围：最近").pack(side="left")
+        self.last_days_var = tk.StringVar(value="")
+        ttk.Entry(winrow, textvariable=self.last_days_var, width=6).pack(
+            side="left", padx=(4, 4)
+        )
+        ttk.Label(winrow, text="天").pack(side="left")
+        ttk.Label(
+            winrow,
+            text="（留空 = 导出全部历史；填 7 即只导出最近 7 天，可带小数如 0.5）",
+            foreground="#6b7280",
+        ).pack(side="left", padx=(8, 0))
+
+        ttk.Separator(pad).grid(row=9, column=0, sticky="ew", pady=10)
 
         self.status = tk.Text(
             pad,
@@ -187,10 +202,10 @@ class App(tk.Tk):
             wrap="word",
             state="disabled",
         )
-        self.status.grid(row=9, column=0, sticky="nsew")
+        self.status.grid(row=10, column=0, sticky="nsew")
 
         bottom = ttk.Frame(pad)
-        bottom.grid(row=10, column=0, sticky="ew", pady=(10, 0))
+        bottom.grid(row=11, column=0, sticky="ew", pady=(10, 0))
         bottom.grid_columnconfigure(0, weight=1)
 
         self.clear_cache_btn = ttk.Button(
@@ -395,6 +410,22 @@ class App(tk.Tk):
         self.last_result = None
         self.log("")
 
+    def _window_args(self) -> dict:
+        """把“最近 N 天”转成 since/until；留空表示不限时间。
+
+        单会话与批量两个入口共用，非法值统一转成可弹窗的 ValueError。
+        """
+        raw = self.last_days_var.get().strip()
+        if not raw:
+            return {"since": None, "until": None}
+        # 结束时间故意留空：导出过程中新到的消息也算进来，避免卡边界丢消息。
+        return last_days_window(raw)
+
+    def _window_desc(self) -> str:
+        """确认框与日志里展示的时间范围文案。"""
+        raw = self.last_days_var.get().strip()
+        return f"最近 {raw} 天" if raw else "不限时间"
+
     def start_export(self):
         name = self.name_var.get().strip()
         if not name:
@@ -409,12 +440,18 @@ class App(tk.Tk):
         if transcribe_voices:
             self.voices_var.set(True)
 
+        try:
+            window = self._window_args()
+        except ValueError as exc:
+            messagebox.showwarning(APP_TITLE, str(exc))
+            return
+
         self.pending_all = False
         if not self._check_media_ready(transcribe_voices):
             return
 
         self._begin_export()
-        self.log(f"开始导出：{name}")
+        self.log(f"开始导出：{name}（时间范围：{self._window_desc()}）")
 
         thread = threading.Thread(
             target=self.worker,
@@ -427,12 +464,21 @@ class App(tk.Tk):
                 self.videos_var.get(),
                 transcribe_voices,
                 self.db_dir_var.get().strip() or None,
+                window,
             ),
             daemon=True,
         )
         thread.start()
 
     def start_export_all(self):
+        # 先校验时间输入（非法值在弹确认框之前就该拦下），再查微信进程。
+        try:
+            window = self._window_args()
+        except ValueError as exc:
+            messagebox.showwarning(APP_TITLE, str(exc))
+            return
+        window_desc = self._window_desc()
+
         if not is_wechat_running():
             self._warn_wechat_not_running()
             return
@@ -445,6 +491,7 @@ class App(tk.Tk):
             "· 每个会话使用由稳定 username 派生的固定目录，避免同名联系人串目录；\n"
             "· 勾选图片、文件、语音或视频时可能占用大量磁盘空间；\n"
             "· 如需先小范围试跑，可用命令行 --all --limit 20。\n\n"
+            f"时间范围：{window_desc}。\n\n"
             "确定开始吗？",
         ):
             return
@@ -458,7 +505,7 @@ class App(tk.Tk):
             return
 
         self._begin_export()
-        self.log("开始导出全部聊天…")
+        self.log(f"开始导出全部聊天…（时间范围：{window_desc}）")
         thread = threading.Thread(
             target=self.worker_all,
             args=(
@@ -469,6 +516,7 @@ class App(tk.Tk):
                 self.videos_var.get(),
                 transcribe_voices,
                 self.db_dir_var.get().strip() or None,
+                window,
             ),
             daemon=True,
         )
@@ -502,6 +550,7 @@ class App(tk.Tk):
         export_videos,
         transcribe_voices,
         db_dir,
+        window=None,
     ):
         try:
             result = export_chat(
@@ -514,6 +563,7 @@ class App(tk.Tk):
                 export_videos=export_videos,
                 transcribe_voices=transcribe_voices,
                 db_dir=db_dir,
+                **(window or {}),
             )
             self.q.put(("done", result))
         except Exception as e:
@@ -528,6 +578,7 @@ class App(tk.Tk):
         export_videos,
         transcribe_voices,
         db_dir,
+        window=None,
     ):
         try:
             result = export_all_chats(
@@ -539,6 +590,7 @@ class App(tk.Tk):
                 export_videos=export_videos,
                 transcribe_voices=transcribe_voices,
                 db_dir=db_dir,
+                **(window or {}),
             )
             self.q.put(("all_done", result))
         except Exception as exc:
