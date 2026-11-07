@@ -50,6 +50,198 @@ class ChatPickerTestBase(unittest.TestCase):
         cls.module = load_module()
 
 
+class TestNormalizeOnlyUsernames(ChatPickerTestBase):
+    """only_usernames 归一化：参数性质错误必须与「会话未发现」区分开。"""
+
+    def test_none_returns_none(self):
+        self.assertIsNone(self.module._normalize_only_usernames(None))
+
+    def test_bare_string_rejected(self):
+        # 防 set("wxid_a") 拆成字符集后把类型错误伪装成「未发现」。
+        with self.assertRaises(ValueError) as cm:
+            self.module._normalize_only_usernames("wxid_a")
+        self.assertIn(
+            "请传入 username 的列表/集合，而不是单个字符串",
+            str(cm.exception),
+        )
+
+    def test_empty_containers_rejected(self):
+        for empty in (set(), [], ()):
+            with self.assertRaises(ValueError) as cm:
+                self.module._normalize_only_usernames(empty)
+            self.assertIn("所选会话列表为空", str(cm.exception))
+
+    def test_non_string_element_rejected(self):
+        with self.assertRaises(ValueError) as cm:
+            self.module._normalize_only_usernames(["wxid_a", 123])
+        message = str(cm.exception)
+        self.assertIn("非法元素", message)
+        self.assertIn("123", message)
+
+    def test_empty_string_element_rejected(self):
+        with self.assertRaises(ValueError) as cm:
+            self.module._normalize_only_usernames({"wxid_a", ""})
+        message = str(cm.exception)
+        self.assertIn("非法元素", message)
+        self.assertIn("非空字符串", message)
+
+    def test_valid_list_returns_set(self):
+        result = self.module._normalize_only_usernames(
+            ["wxid_a", "wxid_b", "wxid_a"]
+        )
+        self.assertEqual(result, {"wxid_a", "wxid_b"})
+
+
+class TestFilterChatsByUsernames(ChatPickerTestBase):
+    """按 username 精确过滤：命中 / 部分未命中 / 全未命中三类。"""
+
+    def test_all_hit_keeps_recency_order(self):
+        chats = make_chats()
+        kept, missed = self.module._filter_chats_by_usernames(
+            chats, {"wxid_b", "111@chatroom"}
+        )
+        self.assertEqual(
+            [item["username"] for item in kept], ["111@chatroom", "wxid_b"]
+        )
+        self.assertEqual(missed, 0)
+        # 不修改入参。
+        self.assertEqual(len(chats), 3)
+
+    def test_partial_miss_is_counted(self):
+        kept, missed = self.module._filter_chats_by_usernames(
+            make_chats(), {"wxid_a", "wxid_ghost"}
+        )
+        self.assertEqual([item["username"] for item in kept], ["wxid_a"])
+        self.assertEqual(missed, 1)
+
+    def test_all_missed_returns_empty_and_count(self):
+        kept, missed = self.module._filter_chats_by_usernames(
+            make_chats(), {"wxid_x", "wxid_y"}
+        )
+        self.assertEqual(kept, [])
+        self.assertEqual(missed, 2)
+
+
+class TestBatchScopeSummary(ChatPickerTestBase):
+    """范围日志三分支：发现 / 选中 / 数量上限的组合判定。"""
+
+    def test_full_mode_without_limit(self):
+        messages = self.module._batch_scope_summary(758, None, False, 758)
+        self.assertEqual(messages, ["共发现 758 个可可靠识别的本地会话。"])
+
+    def test_subset_without_limit_has_no_limit_wording(self):
+        messages = self.module._batch_scope_summary(758, 3, False, 3)
+        self.assertEqual(
+            messages,
+            ["共发现 758 个可可靠识别的本地会话，本次导出选中的 3 个。"],
+        )
+        self.assertFalse(any("数量上限" in m for m in messages))
+
+    def test_subset_with_limit_reports_both(self):
+        messages = self.module._batch_scope_summary(758, 30, True, 10)
+        self.assertTrue(any("本次导出选中的 30 个" in m for m in messages))
+        self.assertTrue(
+            any("已按数量上限只处理最近的 10 个会话。" in m for m in messages)
+        )
+
+    def test_full_mode_with_limit_matches_legacy_wording(self):
+        # 回归锚点：全量 + limit 只报数量上限一条，与现状一致。
+        messages = self.module._batch_scope_summary(758, None, True, 100)
+        self.assertEqual(messages, ["已按数量上限只处理最近的 100 个会话。"])
+
+
+class TestExportAllChatsSubset(ChatPickerTestBase):
+    """_export_all_chats_impl 的子集过滤与 limited 解耦端到端判定。"""
+
+    def _run_impl(self, only_usernames=None, limit=None):
+        chats = [
+            {"username": f"wxid_{i}", "name": f"会话{i}", "is_group": False,
+             "last_time": 100 - i}
+            for i in range(3)
+        ]
+        logs = []
+
+        def fake_impl(**kwargs):
+            return {
+                "chat_name": kwargs["contact"]["name"],
+                "is_group": False,
+                "message_count": 1,
+                "sender_resolution_counts": {"resolved": 1},
+                "media_stats": {"images_requested": 0, "images_exported": 0},
+                "output_dir": str(self.out),
+                "txt": str(self.out / "t.txt"),
+                "md": str(self.out / "t.md"),
+                "json": str(self.out / "t.json"),
+            }
+
+        with (
+            patch.object(self.module, "WeChatDB", return_value=object()),
+            patch.object(
+                self.module, "_batch_chat_candidates",
+                return_value=(chats, 0),
+            ),
+            patch.object(
+                self.module, "_export_chat_impl", side_effect=fake_impl,
+            ),
+            tempfile.TemporaryDirectory() as out_dir,
+        ):
+            self.out = Path(out_dir)
+            result = self.module._export_all_chats_impl(
+                out_root=self.out,
+                progress=logs.append,
+                limit=limit,
+                only_usernames=only_usernames,
+            )
+        return result, logs
+
+    def test_subset_without_limit_no_truncation_wording(self):
+        # 子集 3 个、无 limit：只报「选中的」，不出现「数量上限」。
+        result, logs = self._run_impl(only_usernames={"wxid_0", "wxid_1", "wxid_2"})
+        self.assertFalse(result["limited"])
+        self.assertTrue(any("本次导出选中的 3 个" in m for m in logs))
+        self.assertFalse(any("数量上限" in m for m in logs))
+
+    def test_subset_with_limit_reports_selected_and_limit(self):
+        # 子集 3 个 + limit=1：两条日志都有；limited 为真。
+        result, logs = self._run_impl(
+            only_usernames={"wxid_0", "wxid_1", "wxid_2"}, limit=1,
+        )
+        self.assertTrue(result["limited"])
+        self.assertTrue(any("本次导出选中的 3 个" in m for m in logs))
+        self.assertTrue(any("已按数量上限只处理最近的 1 个会话。" in m for m in logs))
+
+    def test_all_missed_raises_value_error(self):
+        with self.assertRaises(ValueError) as cm:
+            self._run_impl(only_usernames={"wxid_ghost"})
+        message = str(cm.exception)
+        self.assertIn("1 个会话均未在本机发现", message)
+        self.assertIn("共扫描 3 个本地会话", message)
+
+    def test_partial_miss_logs_ignored_line(self):
+        result, logs = self._run_impl(only_usernames={"wxid_0", "wxid_ghost"})
+        self.assertFalse(result["limited"])
+        self.assertTrue(
+            any("有 1 个所选会话未在本机发现，已忽略。" in m for m in logs)
+        )
+        self.assertEqual(result["selected_total"], 1)
+
+    def test_full_mode_with_limit_keeps_legacy_semantics(self):
+        # 回归锚点：全量 + limit 仍截断、meta 三个字段与现状一致。
+        result, logs = self._run_impl(limit=1)
+        self.assertTrue(result["limited"])
+        self.assertEqual(result["discovered_total"], 3)
+        self.assertEqual(result["selected_total"], 1)
+        self.assertTrue(any("已按数量上限只处理最近的 1 个会话。" in m for m in logs))
+
+    def test_export_all_chats_rejects_bare_string(self):
+        with self.assertRaises(ValueError) as cm:
+            self.module.export_all_chats(only_usernames="wxid_a")
+        self.assertIn(
+            "请传入 username 的列表/集合，而不是单个字符串",
+            str(cm.exception),
+        )
+
+
 class TestSortChatsByRecency(ChatPickerTestBase):
     """list_chats 排序：降序、无 last_time 稳定排后、不改动入参。"""
 
