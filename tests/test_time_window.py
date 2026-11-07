@@ -242,11 +242,30 @@ class TestParseTimeBoundRange(WindowTestBase):
         self.assertEqual(self.module.parse_time_bound(_MAX_TS), _MAX_TS)
 
     def test_out_of_range_dates_rejected(self):
-        # 1900/9999 在 Windows 上抛 OSError；1800 越过负 epoch 边界；
-        # 1970-01-02 在 UTC+8 是负 epoch。平台差异必须被统一成 ValueError。
-        for bad in ("1900-01-01", "9999-12-31", "1970-01-02", datetime(1800, 1, 1)):
+        # 与平台/时区无关的硬锚点：这三个值在任何本地时区都落在可表示范围外
+        # （1900 与 9999 在 Windows 上触发 OSError，1800 早于负 epoch 边界），
+        # 必须被统一转成 ValueError。
+        for bad in ("1900-01-01", "9999-12-31", datetime(1800, 1, 1)):
             with self.assertRaises(ValueError):
                 self.module.parse_time_bound(bad)
+
+        # 1970-01-02 的 epoch 正负取决于运行环境的本地时区：
+        # UTC+8 下是 -57600 秒（越界，应拒绝），UTC 下是 +86400 秒（合法，应通过）。
+        # 期望值按当前时区现算，避免 CI（UTC）与本地（UTC+8）结论不一致。
+        try:
+            probe_ts = datetime(1970, 1, 2).timestamp()
+        except OSError:
+            # Windows 的 mktime 不接受负 epoch；本地时区领先 UTC 时即落到这里，
+            # 说明该日期在本地不可表示，与"越界必须拒绝"的期望一致。
+            probe_ts = None
+        if probe_ts is None or probe_ts < 0:
+            with self.assertRaises(ValueError):
+                self.module.parse_time_bound("1970-01-02")
+        else:
+            self.assertEqual(
+                self.module.parse_time_bound("1970-01-02"),
+                int(probe_ts),
+            )
 
 
 class TestLastDaysWindow(WindowTestBase):
