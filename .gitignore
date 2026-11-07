@@ -3,15 +3,21 @@ exports/
 exports*/
 final_export/
 
+# 自定义输出目录（--out / GUI「输出目录」常见命名，前瞻性加固；默认 exports 由上面规则覆盖）
+export_*/
+*_export/
+*_exports/
+chat_export*/
+
 # 聊天原文衍生数据（分析/统计/图表产物，含真实昵称与消息内容，绝不能入库）
 analysis/
 analysis*/
 *_analysis/
 chatlog*/
 chat_logs/
-# 仓库根目录下的分析报告（含真实姓名、群名、互动频次）
-/聊天记录分析报告*.md
-/*分析报告*.md
+# 分析报告（含真实姓名、群名、互动频次），任意层级均忽略
+*聊天记录分析报告*.md
+*分析报告*.md
 
 # 运行日志（可能含本机路径与媒体文件名）
 *.log
@@ -28,6 +34,9 @@ logs/
 wechatauto_db/
 *.sqlite
 *.sqlite3
+*.db
+*.db-wal
+*.db-shm
 
 # wechatauto-replica 默认相对路径副产物
 wechatauto_logs/
@@ -41,11 +50,17 @@ build/
 dist/
 *.spec
 
+# 临时中转文件（导出写盘原子替换产生）
+*.tmp
+
 # IDE / 系统文件
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 本地截图目录（可能包含聊天界面截图）
+.screenshots/
 
 # 本地工具/智能体工作目录（spec、评审记录等过程产物，不入库）
 .trae/

@@ -7,6 +7,7 @@ import queue
 import sys
 import threading
 import tkinter as tk
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -20,6 +21,7 @@ from exporter_core import (
     install_local_asr_model,
     install_rust_silk,
     last_days_window,
+    list_chats,
     local_asr_status,
     rust_silk_status,
 )
@@ -52,6 +54,213 @@ def is_wechat_running() -> bool:
     return False
 
 
+class ChatPickerDialog(tk.Toplevel):
+    """「选择要导出的会话」对话框：行选中高亮模型，username 集合是选中态唯一事实源。"""
+
+    def __init__(self, parent, chats, on_confirm):
+        super().__init__(parent)
+        self.app = parent
+        self.chats = chats
+        self.on_confirm = on_confirm
+        self._selected_usernames = set()
+        # 重渲染 / 程序化改选中时 Treeview 也会发 <<TreeviewSelect>>，
+        # 用该标志避免错误同步选中集合。
+        self._syncing_selection = False
+
+        self.title("选择要导出的会话")
+        self.transient(parent)
+        self.geometry("720x520")
+        self.minsize(560, 380)
+
+        self.grid_rowconfigure(1, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        search_row = ttk.Frame(self, padding=(12, 10, 12, 4))
+        search_row.grid(row=0, column=0, sticky="ew")
+        search_row.grid_columnconfigure(1, weight=1)
+        ttk.Label(search_row, text="搜索：").grid(row=0, column=0, sticky="w")
+        self.search_var = tk.StringVar()
+        self.search_entry = ttk.Entry(search_row, textvariable=self.search_var)
+        self.search_entry.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+        tree_frame = ttk.Frame(self, padding=(12, 4, 12, 4))
+        tree_frame.grid(row=1, column=0, sticky="nsew")
+        tree_frame.grid_rowconfigure(0, weight=1)
+        tree_frame.grid_columnconfigure(0, weight=1)
+
+        columns = ("name", "type", "last_time")
+        self.tree = ttk.Treeview(
+            tree_frame,
+            columns=columns,
+            show="headings",
+            selectmode="extended",
+        )
+        self.tree.heading("name", text="会话名")
+        self.tree.heading("type", text="类型")
+        self.tree.heading("last_time", text="最近消息时间")
+        self.tree.column("name", width=320, anchor="w")
+        self.tree.column("type", width=70, anchor="center", stretch=False)
+        self.tree.column("last_time", width=135, anchor="center", stretch=False)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+
+        scroll = ttk.Scrollbar(
+            tree_frame, orient="vertical", command=self.tree.yview
+        )
+        self.tree.configure(yscrollcommand=scroll.set)
+        scroll.grid(row=0, column=1, sticky="ns")
+
+        btn_row = ttk.Frame(self, padding=(12, 4, 12, 12))
+        btn_row.grid(row=2, column=0, sticky="ew")
+        self.select_all_btn = ttk.Button(
+            btn_row, text="全选", command=self._on_select_all
+        )
+        self.select_all_btn.pack(side="left")
+        self.invert_btn = ttk.Button(btn_row, text="反选", command=self._on_invert)
+        self.invert_btn.pack(side="left", padx=(8, 0))
+        self.rescan_btn = ttk.Button(
+            btn_row, text="重新扫描", command=self._on_rescan
+        )
+        self.rescan_btn.pack(side="left", padx=(8, 0))
+        self.cancel_btn = ttk.Button(btn_row, text="取消", command=self._on_cancel)
+        self.cancel_btn.pack(side="right")
+        self.ok_btn = ttk.Button(btn_row, text="确定", command=self._on_ok)
+        self.ok_btn.pack(side="right", padx=(0, 8))
+
+        self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+        self.search_var.trace_add("write", self._on_search_changed)
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+
+        self._render_list()
+        self.grab_set()
+        self.search_entry.focus_set()
+
+    @staticmethod
+    def _format_last_time(value):
+        if isinstance(value, int) and value > 0:
+            try:
+                return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M")
+            except (OverflowError, OSError, ValueError):
+                return "—"
+        return "—"
+
+    def _visible_chats(self):
+        """按搜索词过滤：匹配显示名或 username 的子串（大小写不敏感）。"""
+        query = self.search_var.get().strip().casefold()
+        if not query:
+            return self.chats
+        matched = []
+        for chat in self.chats:
+            name = (chat.get("name") or "").casefold()
+            username = (chat.get("username") or "").casefold()
+            if query in name or query in username:
+                matched.append(chat)
+        return matched
+
+    def _render_list(self):
+        """按当前过滤词重建可见行；iid 用 username，选中态按集合恢复高亮。"""
+        self._syncing_selection = True
+        try:
+            self.tree.delete(*self.tree.get_children())
+            selected_visible = []
+            for chat in self._visible_chats():
+                username = chat["username"]
+                name = str(chat.get("name") or "").strip() or username
+                chat_type = "群聊" if chat.get("is_group") else "私聊"
+                self.tree.insert(
+                    "",
+                    "end",
+                    iid=username,
+                    values=(
+                        name,
+                        chat_type,
+                        self._format_last_time(chat.get("last_time")),
+                    ),
+                )
+                if username in self._selected_usernames:
+                    selected_visible.append(username)
+            if selected_visible:
+                self.tree.selection_set(selected_visible)
+        finally:
+            self._syncing_selection = False
+
+    def _on_tree_select(self, _event):
+        if self._syncing_selection:
+            return
+        # iid 即 username，原生选中直接同步进唯一事实源集合。
+        self._selected_usernames = set(self.tree.selection())
+
+    def _on_search_changed(self, *_args):
+        self._render_list()
+
+    def _on_select_all(self):
+        children = self.tree.get_children()
+        if children:
+            self.tree.selection_set(children)
+
+    def _on_invert(self):
+        current = set(self.tree.selection())
+        inverted = [
+            iid for iid in self.tree.get_children() if iid not in current
+        ]
+        if inverted:
+            self.tree.selection_set(inverted)
+        else:
+            for iid in current:
+                self.tree.selection_remove(iid)
+
+    def _on_rescan(self):
+        # 重新扫描期间禁用对话框内全部控件，完成后由主窗口恢复。
+        self._set_controls_state("disabled")
+        self.app._scan_chats_async(target=self)
+
+    def _on_ok(self):
+        if not self._selected_usernames:
+            messagebox.showwarning(
+                APP_TITLE,
+                "请至少选择一个会话。",
+                parent=self,
+            )
+            return
+        usernames = set(self._selected_usernames)
+        chats = self.chats
+        self.destroy()
+        if self.on_confirm:
+            self.on_confirm(chats, usernames)
+
+    def _on_cancel(self):
+        # 取消与窗口关闭：销毁对话框，无任何导出副作用。
+        self.destroy()
+
+    def _set_controls_state(self, state):
+        for widget in (
+            self.search_entry,
+            self.select_all_btn,
+            self.invert_btn,
+            self.rescan_btn,
+            self.ok_btn,
+            self.cancel_btn,
+        ):
+            widget.configure(state=state)
+        # Treeview 不支持 configure(state=...)，要用 ttk 的 state 命令。
+        if state == "disabled":
+            self.tree.state(["disabled"])
+        else:
+            self.tree.state(["!disabled"])
+
+    def refresh_chats(self, chats):
+        """「重新扫描」完成后由主窗口调用：刷新列表并保持仍存在的选中态。"""
+        self.chats = chats
+        self._selected_usernames &= {
+            chat["username"] for chat in chats
+        }
+        self._render_list()
+        self._set_controls_state("normal")
+
+    def on_scan_error(self):
+        """「重新扫描」失败后由主窗口调用：恢复控件，保留原列表。"""
+        self._set_controls_state("normal")
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -69,7 +278,11 @@ class App(tk.Tk):
         self.q = queue.Queue()
         self.last_output = None
         self.last_result = None
-        self.pending_all = False
+        # 导出前若触发 rust-silk / 语音模型安装，安装完成后按 mode 恢复对应入口。
+        self.pending_mode = "single"
+        self.pending_usernames = None
+        # 会话扫描缓存：(微信数据目录原始输入, list_chats 结果)，仅存内存。
+        self._scan_cache = None
 
         pad = ttk.Frame(self, padding=18)
         pad.grid(row=0, column=0, sticky="nsew")
@@ -116,6 +329,13 @@ class App(tk.Tk):
             command=self.start_export_all,
         )
         self.export_all_btn.grid(row=0, column=3, padx=(8, 0))
+
+        self.scan_btn = ttk.Button(
+            row,
+            text="扫描选择…",
+            command=self.start_scan_pick,
+        )
+        self.scan_btn.grid(row=0, column=4, padx=(8, 0))
 
         outrow = ttk.Frame(pad)
         outrow.grid(row=4, column=0, sticky="ew", pady=(12, 8))
@@ -277,8 +497,7 @@ class App(tk.Tk):
         if not confirmed:
             return
 
-        self.export_btn.configure(state="disabled")
-        self.export_all_btn.configure(state="disabled")
+        self._set_export_buttons("disabled")
         self.clear_cache_btn.configure(state="disabled")
         self.log("")
         self.log("正在清除敏感临时缓存…")
@@ -330,6 +549,7 @@ class App(tk.Tk):
     def _set_export_buttons(self, state):
         self.export_btn.configure(state=state)
         self.export_all_btn.configure(state=state)
+        self.scan_btn.configure(state=state)
 
     def _warn_wechat_not_running(self):
         self.log("未检测到正在运行的 Windows 微信。")
@@ -446,7 +666,8 @@ class App(tk.Tk):
             messagebox.showwarning(APP_TITLE, str(exc))
             return
 
-        self.pending_all = False
+        self.pending_mode = "single"
+        self.pending_usernames = None
         if not self._check_media_ready(transcribe_voices):
             return
 
@@ -470,7 +691,7 @@ class App(tk.Tk):
         )
         thread.start()
 
-    def start_export_all(self):
+    def start_export_all(self, only_usernames=None):
         # 先校验时间输入（非法值在弹确认框之前就该拦下），再查微信进程。
         try:
             window = self._window_args()
@@ -483,29 +704,51 @@ class App(tk.Tk):
             self._warn_wechat_not_running()
             return
 
-        if not messagebox.askyesno(
-            APP_TITLE,
-            "将导出本机所有能够从本地消息表可靠识别的私聊和群聊。\n\n"
-            "· 只处理实际存在本地消息表的会话，不把‘只加过好友’当成聊天；\n"
-            "· 无法可靠反查 username 的消息表会跳过，不会猜测身份；\n"
-            "· 每个会话使用由稳定 username 派生的固定目录，避免同名联系人串目录；\n"
-            "· 勾选图片、文件、语音或视频时可能占用大量磁盘空间；\n"
-            "· 如需先小范围试跑，可用命令行 --all --limit 20。\n\n"
-            f"时间范围：{window_desc}。\n\n"
-            "确定开始吗？",
-        ):
-            return
+        if only_usernames is None:
+            if not messagebox.askyesno(
+                APP_TITLE,
+                "将导出本机所有能够从本地消息表可靠识别的私聊和群聊。\n\n"
+                "· 只处理实际存在本地消息表的会话，不把‘只加过好友’当成聊天；\n"
+                "· 无法可靠反查 username 的消息表会跳过，不会猜测身份；\n"
+                "· 每个会话使用由稳定 username 派生的固定目录，避免同名联系人串目录；\n"
+                "· 勾选图片、文件、语音或视频时可能占用大量磁盘空间；\n"
+                "· 如需先小范围试跑，可用命令行 --all --limit 20。\n\n"
+                f"时间范围：{window_desc}。\n\n"
+                "确定开始吗？",
+            ):
+                return
+        else:
+            if not messagebox.askyesno(
+                APP_TITLE,
+                f"将导出已选 {len(only_usernames)} 个会话。\n\n"
+                "· 只导出刚才在“选择要导出的会话”里选中的会话；\n"
+                "· 勾选图片、文件、语音或视频时可能占用大量磁盘空间；\n\n"
+                f"时间范围：{window_desc}。\n\n"
+                "确定开始吗？",
+            ):
+                return
 
         transcribe_voices = self.transcribe_var.get()
         if transcribe_voices:
             self.voices_var.set(True)
 
-        self.pending_all = True
+        if only_usernames is None:
+            self.pending_mode = "all"
+            self.pending_usernames = None
+        else:
+            self.pending_mode = "selected"
+            self.pending_usernames = tuple(only_usernames)
         if not self._check_media_ready(transcribe_voices):
             return
 
         self._begin_export()
-        self.log(f"开始导出全部聊天…（时间范围：{window_desc}）")
+        if only_usernames is None:
+            self.log(f"开始导出全部聊天…（时间范围：{window_desc}）")
+        else:
+            self.log(
+                f"开始导出已选 {len(only_usernames)} 个会话…"
+                f"（时间范围：{window_desc}）"
+            )
         thread = threading.Thread(
             target=self.worker_all,
             args=(
@@ -517,10 +760,61 @@ class App(tk.Tk):
                 transcribe_voices,
                 self.db_dir_var.get().strip() or None,
                 window,
+                tuple(only_usernames) if only_usernames is not None else None,
             ),
             daemon=True,
         )
         thread.start()
+
+    def start_scan_pick(self):
+        """「扫描选择…」入口：缓存命中直接弹出对话框，否则后台扫描会话。"""
+        if not is_wechat_running():
+            self._warn_wechat_not_running()
+            return
+        db_dir_raw = self.db_dir_var.get()
+        cache = self._scan_cache
+        if cache is not None and cache[0] == db_dir_raw:
+            self._open_chat_picker(cache[1])
+            return
+        self._scan_chats_async()
+
+    def _scan_chats_async(self, target=None):
+        """后台扫描本地会话。target=None 表示扫描完成后新开选择对话框；
+        传入已打开的对话框则表示其中的「重新扫描」，完成后刷新该对话框。"""
+        db_dir_raw = self.db_dir_var.get()
+        self._set_export_buttons("disabled")
+        self.log("")
+        self.log("正在扫描本地会话…")
+        threading.Thread(
+            target=self.scan_worker,
+            args=(db_dir_raw, target),
+            daemon=True,
+        ).start()
+
+    def scan_worker(self, db_dir_raw, target=None):
+        # 工作线程内绝不直接碰 Tkinter，结果经队列回主线程处理。
+        try:
+            chats = list_chats(
+                db_dir=db_dir_raw.strip() or None,
+                progress=lambda m: self.q.put(("log", m)),
+            )
+            self.q.put(("scan_done", (db_dir_raw, chats, target)))
+        except Exception as exc:
+            self.q.put(("scan_error", (f"{type(exc).__name__}: {exc}", target)))
+
+    def _open_chat_picker(self, chats):
+        ChatPickerDialog(self, chats, on_confirm=self._on_chats_picked)
+
+    def _on_chats_picked(self, chats, usernames):
+        names = []
+        for chat in chats:
+            if chat.get("username") in usernames:
+                names.append(str(chat.get("name") or "").strip())
+        shown = "、".join(names[:5])
+        if len(names) > 5:
+            shown += "等"
+        self.log(f"已选择 {len(usernames)} 个会话：{shown}")
+        self.start_export_all(usernames)
 
     def install_asr_worker(self):
         try:
@@ -579,6 +873,7 @@ class App(tk.Tk):
         transcribe_voices,
         db_dir,
         window=None,
+        only_usernames=None,
     ):
         try:
             result = export_all_chats(
@@ -590,6 +885,7 @@ class App(tk.Tk):
                 export_videos=export_videos,
                 transcribe_voices=transcribe_voices,
                 db_dir=db_dir,
+                only_usernames=only_usernames,
                 **(window or {}),
             )
             self.q.put(("all_done", result))
@@ -606,8 +902,7 @@ class App(tk.Tk):
                     self.last_output = payload["output_dir"]
                     self.last_result = payload
                     self.log(f"输出：{payload['output_dir']}")
-                    self.export_btn.configure(state="normal")
-                    self.export_all_btn.configure(state="normal")
+                    self._set_export_buttons("normal")
                     self.clear_cache_btn.configure(state="normal")
                     self.open_btn.configure(state="normal")
                     self.preview_btn.configure(state="normal")
@@ -686,9 +981,14 @@ class App(tk.Tk):
                         if cleanup_ok
                         else messagebox.showwarning
                     )
+                    done_title = (
+                        "已选会话导出完成"
+                        if self.pending_mode == "selected"
+                        else "全部聊天导出完成"
+                    )
                     show_result(
                         APP_TITLE,
-                        "全部聊天导出完成。\n\n"
+                        f"{done_title}。\n\n"
                         f"可可靠识别会话：{payload['discovered_total']}\n"
                         f"本次处理：{payload['selected_total']}\n"
                         f"成功：{payload['exported']}\n"
@@ -700,8 +1000,7 @@ class App(tk.Tk):
                         f"{cleanup_note}",
                     )
                 elif kind == "cache_cleared":
-                    self.export_btn.configure(state="normal")
-                    self.export_all_btn.configure(state="normal")
+                    self._set_export_buttons("normal")
                     self.clear_cache_btn.configure(state="normal")
                     removed = payload.get("removed") or []
                     failed = payload.get("failed") or []
@@ -730,8 +1029,7 @@ class App(tk.Tk):
                             else "没有发现需要清理的敏感缓存。",
                         )
                 elif kind == "cache_clear_error":
-                    self.export_btn.configure(state="normal")
-                    self.export_all_btn.configure(state="normal")
+                    self._set_export_buttons("normal")
                     self.clear_cache_btn.configure(state="normal")
                     self.log("敏感缓存清理失败：" + payload)
                     messagebox.showerror(
@@ -739,8 +1037,7 @@ class App(tk.Tk):
                         "敏感缓存清理失败：\n\n" + payload,
                     )
                 elif kind == "asr_installed":
-                    self.export_btn.configure(state="normal")
-                    self.export_all_btn.configure(state="normal")
+                    self._set_export_buttons("normal")
                     self.log("本地语音识别模型安装完成。")
                     messagebox.showinfo(
                         APP_TITLE,
@@ -748,39 +1045,57 @@ class App(tk.Tk):
                         "现在可以重新开始导出。",
                     )
                 elif kind == "rust_silk_installed":
-                    self.export_btn.configure(state="normal")
-                    self.export_all_btn.configure(state="normal")
+                    self._set_export_buttons("normal")
                     self.log("rust-silk 安装完成，继续导出。")
-                    resume = (
-                        self.start_export_all if self.pending_all
-                        else self.start_export
-                    )
-                    self.after(0, resume)
+                    # 按 pending_mode 恢复对应导出入口；selected 模式带参恢复，
+                    # 避免把子集导出放大成全量。
+                    if self.pending_mode == "single":
+                        self.after(0, self.start_export)
+                    elif self.pending_mode == "all":
+                        self.after(0, self.start_export_all)
+                    else:
+                        self.after(0, self.start_export_all, self.pending_usernames)
                 elif kind == "rust_silk_error":
-                    self.export_btn.configure(state="normal")
-                    self.export_all_btn.configure(state="normal")
+                    self._set_export_buttons("normal")
                     self.log("rust-silk 安装失败：" + payload)
                     messagebox.showerror(
                         APP_TITLE,
                         "rust-silk 安装失败：\n\n" + payload,
                     )
                 elif kind == "asr_error":
-                    self.export_btn.configure(state="normal")
-                    self.export_all_btn.configure(state="normal")
+                    self._set_export_buttons("normal")
                     self.log("本地语音识别模型安装失败：" + payload)
                     messagebox.showerror(
                         APP_TITLE,
                         "本地语音识别模型安装失败：\n\n" + payload,
                     )
                 elif kind == "error":
-                    self.export_btn.configure(state="normal")
-                    self.export_all_btn.configure(state="normal")
+                    self._set_export_buttons("normal")
                     self.clear_cache_btn.configure(state="normal")
                     self.log("导出失败：" + payload)
                     messagebox.showerror(
                         APP_TITLE,
                         "导出失败：\n\n" + payload,
                     )
+                elif kind == "scan_done":
+                    db_dir_raw, chats, target = payload
+                    self._scan_cache = (db_dir_raw, chats)
+                    self._set_export_buttons("normal")
+                    if target is None:
+                        self._open_chat_picker(chats)
+                    elif target.winfo_exists():
+                        # 对话框内「重新扫描」完成：刷新列表并恢复其控件。
+                        target.refresh_chats(chats)
+                elif kind == "scan_error":
+                    error_text, target = payload
+                    self._set_export_buttons("normal")
+                    self.log("扫描本地会话失败：" + error_text)
+                    messagebox.showerror(
+                        APP_TITLE,
+                        "扫描本地会话失败：\n\n" + error_text,
+                    )
+                    if target is not None and target.winfo_exists():
+                        target.on_scan_error()
         except queue.Empty:
             pass
 

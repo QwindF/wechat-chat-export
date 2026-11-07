@@ -3435,6 +3435,61 @@ def _write_all_chats_index(out_root: Path, chats: list[dict], meta: dict):
     return json_path, md_path
 
 
+def _normalize_only_usernames(value):
+    """把 only_usernames 归一化成 username 集合；None 表示全量模式。
+
+    参数性质错误（裸字符串、空集合、非字符串或空字符串元素）在这里就
+    拦下，避免它们伪装成「会话未在本机发现」这类运行期结果。
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        raise ValueError("请传入 username 的列表/集合，而不是单个字符串。")
+    items = list(value)
+    if not items:
+        raise ValueError("所选会话列表为空。")
+    for item in items:
+        if not isinstance(item, str) or not item:
+            raise ValueError(
+                "所选会话列表包含非法元素（username 须为非空字符串）："
+                f"{item!r}"
+            )
+    return set(items)
+
+
+def _filter_chats_by_usernames(chats, only_usernames):
+    """按 username 精确过滤候选会话，返回 (过滤后新列表, 未命中个数)。
+
+    过滤保持原有排序、不修改入参；only_usernames 为归一化后的
+    username 集合，未命中个数供上层提示「已忽略」或判定全未命中。
+    """
+    kept = [item for item in chats if item.get("username") in only_usernames]
+    hit = {item.get("username") for item in kept}
+    return kept, len(set(only_usernames) - hit)
+
+
+def _batch_scope_summary(discovered_total, selected_total, limited, processed_total):
+    """构造批量导出「发现/选中/上限」范围日志，返回逐条输出的文本列表。
+
+    - selected_total 为 None 表示全量模式：未截断报「共发现 …」，
+      截断时只报「已按数量上限 …」，与既有全量行为一致；
+    - 子集模式始终先报「共发现 …，本次导出选中的 M 个。」；
+    - limited 为真（limit 真的截断了待处理列表）时再追加数量上限提示，
+      processed_total 为截断后实际处理的会话数。
+    """
+    if selected_total is None:
+        if limited:
+            return [f"已按数量上限只处理最近的 {processed_total} 个会话。"]
+        return [f"共发现 {discovered_total} 个可可靠识别的本地会话。"]
+    messages = [
+        f"共发现 {discovered_total} 个可可靠识别的本地会话，"
+        f"本次导出选中的 {selected_total} 个。"
+    ]
+    if limited:
+        messages.append(f"已按数量上限只处理最近的 {processed_total} 个会话。")
+    return messages
+
+
 def _export_all_chats_impl(
     out_root="exports",
     progress=None,
@@ -3448,6 +3503,7 @@ def _export_all_chats_impl(
     limit=None,
     since=None,
     until=None,
+    only_usernames=None,
 ):
     def log(message):
         if progress:
@@ -3481,14 +3537,30 @@ def _export_all_chats_impl(
         )
 
     discovered_total = len(chats)
+    # 子集模式：在数量上限之前按 username 精确过滤；discovered_total 仍记过滤前全量。
+    if only_usernames is not None:
+        chats, missed_count = _filter_chats_by_usernames(chats, only_usernames)
+        if not chats:
+            raise ValueError(
+                f"所选的 {len(only_usernames)} 个会话均未在本机发现"
+                f"（共扫描 {discovered_total} 个本地会话）。"
+            )
+        if missed_count:
+            log(f"有 {missed_count} 个所选会话未在本机发现，已忽略。")
+
+    selected_total = len(chats)
     if limit is not None:
         chats = chats[:limit]
-    limited = len(chats) < discovered_total
+    # limited 只判定 limit 是否真的截断了待处理列表，与子集过滤彻底解耦。
+    limited = limit is not None and limit < selected_total
 
-    if limited:
-        log(f"已按数量上限只处理最近的 {len(chats)} 个会话。")
-    else:
-        log(f"共发现 {discovered_total} 个可可靠识别的本地会话。")
+    for message in _batch_scope_summary(
+        discovered_total,
+        selected_total if only_usernames is not None else None,
+        limited,
+        len(chats),
+    ):
+        log(message)
 
     out_root = Path(out_root)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -3624,8 +3696,12 @@ def export_all_chats(
     limit=None,
     since=None,
     until=None,
+    only_usernames=None,
 ):
     """Export all reliably identified local private/group conversations."""
+    # 子集模式：先做参数归一化，非法输入在进入沙箱前就拦下。
+    only_usernames = _normalize_only_usernames(only_usernames)
+
     if limit is not None:
         try:
             limit = int(limit)
@@ -3660,6 +3736,7 @@ def export_all_chats(
                 limit=limit,
                 since=since,
                 until=until,
+                only_usernames=only_usernames,
             )
     except BaseException:
         _cleanup_sensitive_workdir(workdir, progress=progress)
@@ -3672,6 +3749,66 @@ def export_all_chats(
     result["sensitive_cache_cleanup"] = cleanup_ok
     result["sensitive_cache_cleanup_error"] = cleanup_error
     return result
+
+
+def _sort_chats_by_recency(chats):
+    """按最近消息时间降序构建新列表；无 last_time（None 或 0）稳定排最后。
+
+    只新建列表，不修改入参列表，也不改动其中的会话字典。
+    """
+    def key(item):
+        value = item.get("last_time")
+        known = value if isinstance(value, int) and value > 0 else 0
+        return (0 if known else 1, -known)
+
+    return sorted(chats, key=key)
+
+
+def list_chats(db_dir=None, progress=None):
+    """扫描本机可可靠识别的本地会话，只发现不导出。
+
+    返回 ``[{username, name, is_group, last_time}]``，按最近消息时间降序；
+    没有 last_time 的会话排在最后且顺序稳定。敏感目录生命周期与
+    ``export_all_chats`` 完全一致：先清理上次异常退出留下的失效目录，
+    再创建一次性临时目录，在沙箱内完成扫描，正常结束和异常退出都自动
+    清理临时目录；连接失败等异常自然上抛。
+    """
+    def log(message):
+        if progress:
+            progress(message)
+
+    stale_report = clear_current_sensitive_cache()
+    if progress and stale_report.get("removed"):
+        progress(
+            f"已自动清理 {len(stale_report['removed'])} 个上次异常退出留下的敏感临时目录。"
+        )
+
+    workdir = _create_sensitive_workdir()
+    if progress:
+        progress("敏感数据库密钥和解密缓存将使用一次性临时目录，扫描结束后自动清理。")
+
+    chats = None
+    try:
+        with _upstream_sensitive_sandbox(workdir):
+            # 与批量路径一致：用户给的原始目录先归一化，再传给 WeChatDB。
+            if db_dir:
+                db_dir = resolve_db_dir(db_dir)
+                log(f"正在连接微信本地数据库…（指定目录：{db_dir}）")
+            else:
+                log("正在连接微信本地数据库…")
+            db = WeChatDB(
+                db_dir=db_dir,
+                workdir=str(workdir) if workdir else None,
+            )
+            log("正在扫描本机实际存在消息记录的私聊和群聊…")
+            candidates, _unresolved = _batch_chat_candidates(db, progress=progress)
+            chats = _sort_chats_by_recency(candidates)
+    except BaseException:
+        _cleanup_sensitive_workdir(workdir, progress=progress)
+        raise
+
+    _cleanup_sensitive_workdir(workdir, progress=progress)
+    return chats
 
 
 def export_chat(
