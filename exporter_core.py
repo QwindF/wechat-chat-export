@@ -3674,6 +3674,66 @@ def export_all_chats(
     return result
 
 
+def _sort_chats_by_recency(chats):
+    """按最近消息时间降序构建新列表；无 last_time（None 或 0）稳定排最后。
+
+    只新建列表，不修改入参列表，也不改动其中的会话字典。
+    """
+    def key(item):
+        value = item.get("last_time")
+        known = value if isinstance(value, int) and value > 0 else 0
+        return (0 if known else 1, -known)
+
+    return sorted(chats, key=key)
+
+
+def list_chats(db_dir=None, progress=None):
+    """扫描本机可可靠识别的本地会话，只发现不导出。
+
+    返回 ``[{username, name, is_group, last_time}]``，按最近消息时间降序；
+    没有 last_time 的会话排在最后且顺序稳定。敏感目录生命周期与
+    ``export_all_chats`` 完全一致：先清理上次异常退出留下的失效目录，
+    再创建一次性临时目录，在沙箱内完成扫描，正常结束和异常退出都自动
+    清理临时目录；连接失败等异常自然上抛。
+    """
+    def log(message):
+        if progress:
+            progress(message)
+
+    stale_report = clear_current_sensitive_cache()
+    if progress and stale_report.get("removed"):
+        progress(
+            f"已自动清理 {len(stale_report['removed'])} 个上次异常退出留下的敏感临时目录。"
+        )
+
+    workdir = _create_sensitive_workdir()
+    if progress:
+        progress("敏感数据库密钥和解密缓存将使用一次性临时目录，扫描结束后自动清理。")
+
+    chats = None
+    try:
+        with _upstream_sensitive_sandbox(workdir):
+            # 与批量路径一致：用户给的原始目录先归一化，再传给 WeChatDB。
+            if db_dir:
+                db_dir = resolve_db_dir(db_dir)
+                log(f"正在连接微信本地数据库…（指定目录：{db_dir}）")
+            else:
+                log("正在连接微信本地数据库…")
+            db = WeChatDB(
+                db_dir=db_dir,
+                workdir=str(workdir) if workdir else None,
+            )
+            log("正在扫描本机实际存在消息记录的私聊和群聊…")
+            candidates, _unresolved = _batch_chat_candidates(db, progress=progress)
+            chats = _sort_chats_by_recency(candidates)
+    except BaseException:
+        _cleanup_sensitive_workdir(workdir, progress=progress)
+        raise
+
+    _cleanup_sensitive_workdir(workdir, progress=progress)
+    return chats
+
+
 def export_chat(
     keyword: str,
     out_root="exports",
